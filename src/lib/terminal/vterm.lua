@@ -348,6 +348,18 @@ function VTermHandle:feed(bytes)
     if bytes:find("\27[?1006l", 1, true) then
         self._sgr_mouse = false
     end
+    -- Bracketed paste (2004h/l). Cuando el shell (bash/readline,
+    -- zsh, vim en modo paste, ...) lo activa, cada pegado debe
+    -- envolverse en ESC[200~ ... ESC[201~. Sin el wrapper, cada
+    -- newline del texto pegado lo procesa el shell como Enter y
+    -- ejecuta cada linea como comando separado: el prompt aparece
+    -- entre cada linea.
+    if bytes:find("\27[?2004h", 1, true) then
+        self._bracketed_paste = true
+    end
+    if bytes:find("\27[?2004l", 1, true) then
+        self._bracketed_paste = false
+    end
     if bytes:find("\27[?1005h", 1, true)
        or bytes:find("\27[?1015h", 1, true) then
         self._sgr_mouse = true

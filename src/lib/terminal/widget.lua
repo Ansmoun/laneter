@@ -829,7 +829,7 @@ function Terminal:on_key(key)
     end
     if m.shift and not m.ctrl and (n == "Insert") then
         local text = clip.paste_from("clipboard")
-        if text then pty.write(self.pty.fd, text) end
+        if text then self:_paste(text) end
         return true
     end
 
@@ -846,8 +846,7 @@ function Terminal:on_key(key)
     if kb.match(key, b.paste) then
         local text = clip.paste_from("clipboard")
         if text then
-            pty.write(self.pty.fd, text)
-            log.info("terminal", "paste %d bytes", #text)
+            self:_paste(text)
         end
         return true
     end
@@ -1006,6 +1005,21 @@ function Terminal:apply_preferences(prefs)
             if self.window then self.window:damage_all() end
         end
     end
+end
+
+-- Envia el texto al PTY. Si el shell activo bracketed paste
+-- (ESC[?2004h), lo envuelve en ESC[200~ ... ESC[201~. Sin esto,
+-- pegar un bloque multilinea hace que cada \n lo procese el
+-- shell como Enter y ejecute cada linea como comando separado.
+function Terminal:_paste(text)
+    if not self.pty then return end
+    local seq = text
+    if self.term and self.term._bracketed_paste then
+        seq = "\27[200~" .. text .. "\27[201~"
+    end
+    pty.write(self.pty.fd, seq)
+    log.info("terminal", "paste %d bytes (bracketed=%s)",
+        #text, tostring(self.term and self.term._bracketed_paste))
 end
 
 function Terminal:destroy()
