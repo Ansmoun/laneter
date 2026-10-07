@@ -133,17 +133,53 @@ ColorPalette.__index = ColorPalette
 function ColorPalette.new(opts)
     opts = opts or {}
     local self = setmetatable(Area.new({}), ColorPalette)
+    self._hover_visual = true
     self.colors  = opts.colors or PALETTE
     self.selected = opts.selected
     self.on_select = opts.on_select
     self.enabled  = opts.enabled ~= false
     self.swatch   = 22
     self.gap      = 4
+    self._hover_idx = nil
     self.min_h = self.swatch + 8
     self.max_h = self.min_h
     self.min_w = #self.colors * (self.swatch + self.gap)
     self.max_w = self.min_w
     return self
+end
+
+-- Indice del swatch bajo (mx, my) o nil si el click cae en el gap
+-- o fuera del rect.
+function ColorPalette:_index_at(mx, my)
+    if my < 4 or my > 4 + self.swatch then return nil end
+    local i = math.floor(mx / (self.swatch + self.gap)) + 1
+    if i < 1 or i > #self.colors then return nil end
+    local off = mx - (i - 1) * (self.swatch + self.gap)
+    if off > self.swatch then return nil end
+    return i
+end
+
+function ColorPalette:on_mouse_move(mx, my)
+    if not self.enabled then
+        if self._hover_idx then
+            self._hover_idx = nil
+            self:damage()
+        end
+        return
+    end
+    local i = self:_index_at(mx, my)
+    if i ~= self._hover_idx then
+        self._hover_idx = i
+        self:damage()
+    end
+end
+
+function ColorPalette:set_hover(v)
+    Area.set_hover(self, v)
+    if not v and self._hover_idx then
+        self._hover_idx = nil
+        self:damage()
+    end
 end
 
 function ColorPalette:set_selected(hex)
@@ -163,13 +199,32 @@ function ColorPalette:draw(cr)
         local x = x0 + (i - 1) * (self.swatch + self.gap)
         local y = y0 + 4
         local r, g, b = G.hex_to_rgba(hex)
+
         if not self.enabled then
-            cairo.set_rgba(cr, r, g, b, 0.35)
+            -- Deshabilitado: colores apagados + borde gris tenue.
+            cairo.set_rgba(cr, r, g, b, 0.18)
+            cairo.rounded_rect(cr, x, y, self.swatch, self.swatch, 4)
+            cairo.fill(cr)
+            cairo.set_rgba(cr, 0.5, 0.5, 0.5, 0.4)
+            cairo.set_line_width(cr, 1)
+            cairo.rounded_rect(cr, x + 0.5, y + 0.5,
+                self.swatch - 1, self.swatch - 1, 4)
+            cairo.stroke(cr)
         else
             cairo.set_rgb(cr, r, g, b)
+            cairo.rounded_rect(cr, x, y, self.swatch, self.swatch, 4)
+            cairo.fill(cr)
+
+            -- Hover: borde claro.
+            if i == self._hover_idx and hex ~= self.selected then
+                cairo.set_rgba(cr, 1, 1, 1, 0.6)
+                cairo.set_line_width(cr, 1)
+                cairo.rounded_rect(cr, x + 0.5, y + 0.5,
+                    self.swatch - 1, self.swatch - 1, 4)
+                cairo.stroke(cr)
+            end
         end
-        cairo.rounded_rect(cr, x, y, self.swatch, self.swatch, 4)
-        cairo.fill(cr)
+
         if hex == self.selected then
             local ar, ag, ab = G.hex_to_rgba(T.accent or "#8ec07c")
             cairo.set_rgb(cr, ar, ag, ab)
@@ -183,12 +238,9 @@ end
 
 function ColorPalette:on_mouse_press(mx, my, button)
     if button ~= 1 or not self.enabled then return end
-    local i = math.floor(mx / (self.swatch + self.gap)) + 1
+    local i = self:_index_at(mx, my)
+    if not i then return end
     local hex = self.colors[i]
-    if not hex then return end
-    -- Validar el click horizontal dentro del swatch (descartar el gap).
-    local off = mx - (i - 1) * (self.swatch + self.gap)
-    if off > self.swatch then return end
     self.selected = hex
     self:damage()
     if self.on_select then self.on_select(hex) end
@@ -434,6 +486,11 @@ local function build_tab_apariencia(T, prefs)
     -- Chips de modo (radio simple hecho con dos botones).
     local mode = prefs.color_mode or "theme"
     local btn_theme, btn_custom
+    -- Forward declarations. Los botones de modo se crean ANTES que
+    -- hint_lbl/refresh_hint, pero sus on_click las llaman. Sin este
+    -- forward, refresh_hint es un global (nil) al invocarse y crashea.
+    local hint_lbl
+    local refresh_hint
     local function refresh_mode_buttons()
         local function set_colors(btn, active)
             if active then
@@ -500,6 +557,7 @@ local function build_tab_apariencia(T, prefs)
             mode = "theme"
             set_palettes_enabled(false)
             refresh_mode_buttons()
+            refresh_hint()
         end,
     }
     btn_custom = W.Button.new {
@@ -516,6 +574,7 @@ local function build_tab_apariencia(T, prefs)
             mode = "custom"
             set_palettes_enabled(true)
             refresh_mode_buttons()
+            refresh_hint()
         end,
     }
     refresh_mode_buttons()
@@ -529,6 +588,27 @@ local function build_tab_apariencia(T, prefs)
             { widget = W.Text.new { text = "", min_width = 1 }, weight = 1 },
         },
     }
+
+    -- Etiqueta contextual: avisa si los swatches estan activos o no.
+    hint_lbl = W.Text.new {
+        text = "",
+        font = "DejaVu Sans 9",
+        align = "left", valign = "center",
+        r = (T.muted_rgb or { 0.55, 0.55, 0.55 })[1],
+        g = (T.muted_rgb or { 0.55, 0.55, 0.55 })[2],
+        b = (T.muted_rgb or { 0.55, 0.55, 0.55 })[3],
+    }
+    refresh_hint = function()
+        if mode == "theme" then
+            hint_lbl:set_text(
+                "El terminal usa los colores del tema LANE. "
+                .. "Elegí 'Personalizados' para editar los colores.")
+        else
+            hint_lbl:set_text(
+                "Hacé click en un cuadro de color para aplicarlo.")
+        end
+    end
+    refresh_hint()
 
     local function palette_row(label, pal)
         return W.Group.new {
@@ -562,6 +642,7 @@ local function build_tab_apariencia(T, prefs)
                 b = (T.fg_rgb or {0.9,0.9,0.9})[3],
               }, weight = 0 },
             { widget = mode_row, weight = 0 },
+            { widget = hint_lbl, weight = 0 },
             { widget = W.Text.new { text = "", min_height = 6 }, weight = 0 },
             { widget = palette_row("Color de texto",  pal_text), weight = 0 },
             { widget = palette_row("Color de fondo",  pal_bg),   weight = 0 },
