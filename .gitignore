@@ -4,3 +4,6 @@
 *.swp
 *.tmp
 .DS_Store
+
+# Atajos y preferencias locales del desarrollador. No se commitean.
+src/lib/terminal/local_overrides.lua
