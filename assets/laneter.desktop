@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Terminal
+GenericName=Emulador de terminal
+Comment=Terminal para LANE
+Exec=/opt/laneter/run app.lua
+Icon=utilities-terminal
+Terminal=false
+Categories=System;TerminalEmulator;Utility;
+Keywords=terminal;consola;shell;bash;sh;
+StartupNotify=true
+StartupWMClass=lanetk

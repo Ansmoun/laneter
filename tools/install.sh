@@ -38,4 +38,19 @@ if ./run -e 'print("requires OK")' 2>&1; then
 else
     echo "    FALLO" >&2; exit 1
 fi
+
+# Instalar el .desktop en el home del usuario real (el que invoco
+# sudo, no root).
+DESKTOP_DIR="$REAL_HOME/.local/share/applications"
+if [ -f "$DST/assets/laneter.desktop" ]; then
+    mkdir -p "$DESKTOP_DIR"
+    cp "$DST/assets/laneter.desktop" "$DESKTOP_DIR/laneter.desktop"
+    chown "$(id -u "${SUDO_USER:-$USER}"):$(id -g "${SUDO_USER:-$USER}" 2>/dev/null || echo "$(id -g)")" \
+        "$DESKTOP_DIR/laneter.desktop" 2>/dev/null || true
+    if command -v update-desktop-database >/dev/null 2>&1; then
+        update-desktop-database "$DESKTOP_DIR" >/dev/null 2>&1 || true
+    fi
+    echo "==> .desktop instalado en $DESKTOP_DIR/laneter.desktop"
+fi
+
 echo "==> Instalación completa. laneter en $DST"
