@@ -331,6 +331,36 @@ VTermHandle.PROP_MOUSE = 8
 
 function VTermHandle:feed(bytes)
     if type(bytes) ~= "string" or #bytes == 0 then return end
+    -- Detectar modo 1006 (SGR extended mouse). libvterm 0.3.3 no
+    -- expone el encoding en VTERM_PROP_MOUSE, solo on/off. Cuando
+    -- htop activa 1006 y nosotros mandamos X10 (ESC [ M + 3 bytes),
+    -- htop no entiende el formato y parsea la secuencia como
+    -- teclas sueltas -> efectos raros (colapsar header, taggeos
+    -- aleatorios, toggles de layout).
+    -- find con plain=true: buscar el string literal, sin patrones
+    -- Lua. El `?` es quantifier en Lua patterns, sin esto la
+    -- deteccion nunca matchea y siempre mandamos X10, que htop
+    -- interpreta como basura (borra lineas, manda caracteres
+    -- como texto, dispara teclas sueltas como M = toggle meters).
+    if bytes:find("\27[?1006h", 1, true) then
+        self._sgr_mouse = true
+    end
+    if bytes:find("\27[?1006l", 1, true) then
+        self._sgr_mouse = false
+    end
+    if bytes:find("\27[?1005h", 1, true)
+       or bytes:find("\27[?1015h", 1, true) then
+        self._sgr_mouse = true
+    end
+    -- Debug: ver que pide htop al activar mouse.
+    if os.getenv("LANET_FEED_LOG") == "1"
+       and bytes:find("\27[?", 1, true) then
+        local t = require("lib.timer").now_ms()
+        local esc = bytes:gsub("[%c]", function(c)
+            return string.format("\\x%02x", c:byte())
+        end)
+        io.stderr:write(string.format("[feed %d] %s\n", t, esc))
+    end
     -- CRITICO: vterm_input_write puede disparar decenas de miles
     -- de callbacks FFI (sb_pushline por cada linea que sale del
     -- viewport). Si el GC de LuaJIT corre en medio del trampolin

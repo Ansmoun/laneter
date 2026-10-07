@@ -23,6 +23,7 @@ local clip   = require("lib.terminal.clipboard")
 local config = require("lib.config")
 local kb     = require("lib.keybindings")
 local timer  = require("lib.timer")
+local termcaps = require("lib.terminal.termcaps")
 
 local M = {}
 
@@ -97,6 +98,9 @@ function M.new(opts)
     -- avisa por el callback settermprop.
     self._mouse_enabled = false
     self._mouse_mode = 0   -- flags de libvterm: 1 click, 2 drag, 4 move
+    -- Default del terminfo (kmous): "sgr" o "x10". Se puede override
+    -- en runtime si la app pide 1006h/l explicito (ver vterm.feed).
+    self._mouse_encoding = termcaps.mouse_encoding()
     self._mouse_last_row = 0
     self._mouse_last_col = 0
     self._mods_cache = 0
@@ -191,6 +195,7 @@ function Terminal:set_window(win)
         self._cursor_timer = win.server:add_timer(CURSOR_BLINK_MS,
             function()
                 if not self._blink_enabled then return end
+                if not self.term then return end
                 self._cursor_visible = not self._cursor_visible
                 if self.window then self.window:damage_all() end
             end)
@@ -212,6 +217,11 @@ function Terminal:is_blink_enabled()
 end
 
 function Terminal:_on_pty_readable()
+    -- Si el terminal ya se destruyo (cerrar ventana), no hay pty
+    -- ni term. Sin este guard, el fd callback dispara una vez mas
+    -- durante el cierre y crashea con "attempt to index field
+    -- 'pty' (a nil value)".
+    if not self.pty or not self.term then return end
     -- Limitar cuanto procesamos por invocacion del callback. Con
     -- 1 GB de output (por ejemplo `seq 1 1000000` x varias veces)
     -- el while drenaria el PTY sin ceder, sin dejar correr el GC,
@@ -592,23 +602,67 @@ end
 function Terminal:_mouse_seq(button, row, col, is_motion, is_release)
     if row < 0 then row = 0 end
     if col < 0 then col = 0 end
-    -- Clamp a 222 para no desbordar el byte (Cx/Cy max = 255).
     if row > 222 then row = 222 end
     if col > 222 then col = 222 end
+
     local m = self:_mouse_mods()
-    -- Protocolo X10: Cb = 32 + button_code + mods (+32 si motion).
-    -- Release: button_code = 3.
-    local bcode = button
-    if is_release then bcode = 3 end
-    local cb = 32 + bcode + m
-    if is_motion then cb = cb + 32 end
-    local cx = 33 + col
-    local cy = 33 + row
-    return string.char(27, 91, 77, cb, cx, cy)
+
+    -- Elegir protocolo: override del vterm si lo hay; si no, el
+    -- default del terminfo (kmous via termcaps.mouse_encoding()).
+    local use_sgr
+    if self.term and self.term._mouse_override ~= nil then
+        use_sgr = self.term._mouse_override
+    else
+        use_sgr = (self._mouse_encoding == "sgr")
+    end
+
+    local seq
+    if use_sgr then
+        -- SGR (1006): ESC[<Cb;Cx;CyM (press) / ESC[<Cb;Cx;Cym (release).
+        --
+        -- CRITICO: en SGR el Cb es SIEMPRE el numero del boton
+        -- (0=izq, 1=medio, 2=der) tanto en press como en release.
+        -- La distincion la hace la letra final (M vs m).
+        -- El "codigo 3 = release" es del protocolo X10 viejo y no
+        -- aplica a SGR. Mandarlo hace que ncurses interprete un
+        -- release del boton 3 sin press previo y descarte el click.
+        local cb = button + m
+        if is_motion then cb = cb + 32 end
+        local terminator = is_release and "m" or "M"
+        seq = string.format("\27[<%d;%d;%d%s", cb, col + 1, row + 1, terminator)
+    else
+        -- X10: ESC[M + 3 bytes (Cb+32, Cx+33, Cy+33).
+        -- Aca SI se usa bcode=3 para release.
+        local bcode = button
+        if is_release then bcode = 3 end
+        local cb = bcode + m
+        if is_motion then cb = cb + 32 end
+        seq = string.char(27, 91, 77, 32 + cb, 32 + col + 1, 32 + row + 1)
+    end
+
+    if os.getenv("LANET_MOUSE_DEBUG") == "1" then
+        local t = require("lib.timer").now_ms()
+        local hex = {}
+        for i = 1, #seq do hex[#hex + 1] = string.format("%02x", seq:byte(i)) end
+        io.stderr:write(string.format(
+            "[mouse %d] seq b=%d row=%d col=%d sgr=%s mot=%s rel=%s -> %s\n",
+            t, button, row, col,
+            tostring(use_sgr),
+            tostring(is_motion), tostring(is_release),
+            table.concat(hex, " ")))
+    end
+    return seq
 end
 
 function Terminal:on_mouse_press(mx, my, button)
     local row, col = self:_cell_at(mx, my)
+    if os.getenv("LANET_MOUSE_DEBUG") == "1" then
+        local cw, ch = self.renderer:cell_size()
+        local t = require("lib.timer").now_ms()
+        io.stderr:write(string.format(
+            "[mouse %d] press mx=%d my=%d x0=%d y0=%d cell=%dx%d -> row=%d col=%d\n",
+            t, mx, my, self.x0, self.y0, cw, ch, row, col))
+    end
     self._mouse_last_row = row
     self._mouse_last_col = col
 
@@ -677,20 +731,19 @@ function Terminal:on_mouse_move(mx, my)
 end
 
 function Terminal:on_wheel(direction)
+    if not self.term or not self.pty then return false end
     -- Si la app pidio mouse reporting, mandarle el scroll como
     -- boton 4 (arriba) / 5 (abajo) de xterm. Convencion universal.
     if self._mouse_enabled and self.pty then
         local shift_held = bit.band(self:_mouse_mods(), 4) ~= 0
         if not shift_held then
-            -- button_code: 64=up, 65=down. En X10-compat se manda
-            -- press + release (no hay boton fisico que soltar).
+            -- button_code: 64=up, 65=down (convencion xterm).
+            -- Press + release (no hay boton fisico que soltar).
             local code = (direction == 4) and 64 or 65
             local cx = self._mouse_last_col
             local cy = self._mouse_last_row
-            local seq_press = string.char(27, 91, 77,
-                32 + code + self:_mouse_mods(), 33 + cx, 33 + cy)
-            local seq_release = string.char(27, 91, 77,
-                32 + 3 + self:_mouse_mods(), 33 + cx, 33 + cy)
+            local seq_press = self:_mouse_seq(code, cy, cx, false, false)
+            local seq_release = self:_mouse_seq(0, cy, cx, false, true)
             pty.write(self.pty.fd, seq_press .. seq_release)
             return true
         end
