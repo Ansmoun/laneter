@@ -131,6 +131,27 @@ _cb_keepalive.clear = function(user)
     return 0
 end
 
+-- settermprop: libvterm lo dispara cuando la app que corre en el
+-- terminal (vim, htop, less) cambia alguna propiedad del terminal.
+-- Nos interesa VTERM_PROP_MOUSE (id 8): cuando la app pide mouse
+-- reporting, libvterm avisa y nosotros empezamos a mandarle los
+-- eventos del mouse. val es VTermValue*, union cuyo primer campo
+-- es int (o int boolean/number, mismo layout).
+_cb_keepalive.settermprop = function(prop, val, user)
+    local ok, err = pcall(function()
+        local id = tonumber(ffi.cast("intptr_t", user))
+        local h = _handlers[id]
+        if h and h.on_settermprop then
+            local number = ffi.cast("int*", val)[0]
+            h.on_settermprop(prop, number)
+        end
+    end)
+    if not ok then
+        io.stderr:write("[vterm settermprop] " .. tostring(err) .. "\n")
+    end
+    return 0
+end
+
 -- Mascaras de VTermScreenCellAttrs (bits LSB-first segun layout
 -- de gcc en x86_64 System V).
 local BOLD      = 0x0001
@@ -180,6 +201,29 @@ end
 local VTermHandle = {}
 VTermHandle.__index = VTermHandle
 
+-- Cache global de colores convertidos. El indice es (R<<16)|(G<<8)|B.
+-- Hay 256 colores de paleta + RGBs custom. Reusar la tabla evita
+-- crear 3472 tablas nuevas por snapshot.
+local _color_cache = {}
+local function cached_color(r, g, b)
+    local key = r * 65536 + g * 256 + b
+    local c = _color_cache[key]
+    if c then return c end
+    c = { r, g, b }
+    _color_cache[key] = c
+    return c
+end
+
+-- Cdata reusado para pos y cell. Un solo par por instancia.
+-- Antes cada cell() creaba dos cdata nuevos; con 3472 celdas por
+-- snapshot eran 6944 allocaciones nuevas cada vez.
+local function ensure_scratch(self)
+    if not self._pos then
+        self._pos  = ffi.new("VTermPos")
+        self._cell = ffi.new("VTermScreenCell")
+    end
+end
+
 function M.new(cols, rows)
     cols = cols or 80
     rows = rows or 24
@@ -200,6 +244,7 @@ function M.new(cols, rows)
     cbs.sb_pushline = _cb_keepalive.pushline
     cbs.sb_popline  = _cb_keepalive.popline
     cbs.sb_clear    = _cb_keepalive.clear
+    cbs.settermprop = _cb_keepalive.settermprop
     _next_id = _next_id + 1
     local my_id = _next_id
     lib.vterm_screen_set_callbacks(screen, cbs,
@@ -244,10 +289,45 @@ function VTermHandle:set_scrollback_callbacks(handler)
     -- funcion adentro de self, y usamos self como handler.
     -- Mantenemos la referencia al self (que ya esta registrado
     -- en _handlers[id]).
-    self.on_pushline = handler.on_pushline
-    self.on_popline  = handler.on_popline
-    self.on_clear    = handler.on_clear
+    self.on_pushline    = handler.on_pushline
+    self.on_popline     = handler.on_popline
+    self.on_clear       = handler.on_clear
+    -- settermprop es opcional: la app lo usa para saber cuando el
+    -- terminal debe entrar en mouse reporting.
+    self.on_settermprop = handler.on_settermprop
 end
+
+-- ── Mouse reporting ────────────────────────────────────────
+--
+-- Cuando la app que corre dentro del terminal pide mouse
+-- reporting (via ESC[?1000h o 1002h o 1003h o 1006h), libvterm
+-- dispara on_settermprop(VTERM_PROP_MOUSE, mode) donde mode != 0
+-- significa "activo". El widget consulta self._mouse_enabled y,
+-- si esta activo, redirige los eventos del mouse a estas
+-- funciones.
+--
+-- button: 1 = izquierda, 2 = medio, 3 = derecha (mismos codigos
+-- que xterm y que los eventos X11).
+-- mods: bitmask: 4 = shift, 8 = alt/meta, 16 = ctrl.
+
+function VTermHandle:mouse_move(row, col, mods)
+    lib.vterm_mouse_move(self.vt, row, col, mods or 0)
+end
+
+function VTermHandle:mouse_button(button, pressed, mods)
+    lib.vterm_mouse_button(self.vt, button, pressed, mods or 0)
+end
+
+-- Drena el buffer de output de libvterm (las secuencias de mouse
+-- que genero a partir de los eventos). Se escribe al PTY.
+function VTermHandle:drain_output()
+    local buf = ffi.new("char[128]")
+    local n = lib.vterm_output_read(self.vt, buf, 128)
+    if n == 0 then return "" end
+    return ffi.string(buf, n)
+end
+
+VTermHandle.PROP_MOUSE = 8
 
 function VTermHandle:feed(bytes)
     if type(bytes) ~= "string" or #bytes == 0 then return end
@@ -270,21 +350,25 @@ function VTermHandle:feed(bytes)
 end
 
 function VTermHandle:cell(row, col)
-    local pos = ffi.new("VTermPos")
+    ensure_scratch(self)
+    local pos = self._pos
+    local cell = self._cell
     pos.row = row
     pos.col = col
-    local cell = ffi.new("VTermScreenCell")
     if lib.vterm_screen_get_cell(self.screen, pos, cell) == 0 then
         return nil
     end
+
+    local bits = cell.attrs.bits
     if cell.chars[0] == 0 then
-        -- Celda vacia.
+        -- Celda vacia. Devolvemos tabla minima; el render tiene
+        -- una ruta rapida para utf8 == "".
         return {
             utf8 = "", width = 0,
             fg = nil, bg = nil,
-            attrs = { bold=false, underline=false, italic=false,
-                      blink=false, reverse=false, conceal=false,
-                      strike=false, font=0 },
+            bold = false, italic = false,
+            underline = false, strike = false, conceal = false,
+            reverse = false,
         }
     end
 
@@ -296,22 +380,28 @@ function VTermHandle:cell(row, col)
         parts[#parts + 1] = utf8_encode(cp)
     end
 
-    local bits = cell.attrs.bits
+    -- Colores via cache. color_to_rgb ya devuelve {r,g,b}; lo
+    -- pasamos por cached_color para dedupe.
+    local fg = color_to_rgb(self.screen, cell.fg)
+    local bg = color_to_rgb(self.screen, cell.bg)
+    if fg then fg = cached_color(fg[1], fg[2], fg[3]) end
+    if bg then bg = cached_color(bg[1], bg[2], bg[3]) end
+
+    -- Tabla con campos planos (sin sub-tabla attrs). El render lee
+    -- directo cell.bold, cell.underline, etc. Menos allocaciones.
     return {
-        utf8  = table.concat(parts),
-        width = tonumber(cell.width),
-        fg    = color_to_rgb(self.screen, cell.fg),
-        bg    = color_to_rgb(self.screen, cell.bg),
-        attrs = {
-            bold      = bit.band(bits, BOLD) ~= 0,
-            underline = bit.band(bits, UNDERLINE) ~= 0,
-            italic    = bit.band(bits, ITALIC) ~= 0,
-            blink     = bit.band(bits, BLINK) ~= 0,
-            reverse   = bit.band(bits, REVERSE) ~= 0,
-            conceal   = bit.band(bits, CONCEAL) ~= 0,
-            strike    = bit.band(bits, STRIKE) ~= 0,
-            font      = bit.band(bit.rshift(bits, 8), 0x0F),
-        },
+        utf8      = table.concat(parts),
+        width     = tonumber(cell.width),
+        fg        = fg,
+        bg        = bg,
+        bold      = bit.band(bits, BOLD) ~= 0,
+        underline = bit.band(bits, UNDERLINE) ~= 0,
+        italic    = bit.band(bits, ITALIC) ~= 0,
+        blink     = bit.band(bits, BLINK) ~= 0,
+        reverse   = bit.band(bits, REVERSE) ~= 0,
+        conceal   = bit.band(bits, CONCEAL) ~= 0,
+        strike    = bit.band(bits, STRIKE) ~= 0,
+        font      = bit.band(bit.rshift(bits, 8), 0x0F),
     }
 end
 

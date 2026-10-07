@@ -22,6 +22,7 @@ local Sel    = require("lib.terminal.selection")
 local clip   = require("lib.terminal.clipboard")
 local config = require("lib.config")
 local kb     = require("lib.keybindings")
+local timer  = require("lib.timer")
 
 local M = {}
 
@@ -91,7 +92,17 @@ function M.new(opts)
     self.term = vterm.new(self.cols, self.rows)
     assert(self.term, "vterm.new fallo")
 
-    -- Registrar callbacks de scrollback.
+    -- Estado del mouse reporting. Lo activa/desactiva la app que
+    -- corre dentro del terminal (via ESC[?1000h) y libvterm nos
+    -- avisa por el callback settermprop.
+    self._mouse_enabled = false
+    self._mouse_mode = 0   -- flags de libvterm: 1 click, 2 drag, 4 move
+    self._mouse_last_row = 0
+    self._mouse_last_col = 0
+    self._mods_cache = 0
+    self._mods_cache_t = 0
+
+    -- Registrar callbacks de scrollback + mouse.
     self.term:set_scrollback_callbacks {
         on_pushline = function(text, cols)
             self:_push_scrollback_line(text)
@@ -100,6 +111,15 @@ function M.new(opts)
             self.scrollback = {}
             self.scrollback_head = 1
             self.scrollback_count = 0
+        end,
+        on_settermprop = function(prop, value)
+            if prop == self.term.PROP_MOUSE then
+                self._mouse_enabled = (value ~= 0)
+                self._mouse_mode = value
+                log.info("terminal",
+                    "mouse reporting: %s (flags 0x%x)",
+                    tostring(self._mouse_enabled), value)
+            end
         end,
     }
 
@@ -192,7 +212,16 @@ function Terminal:is_blink_enabled()
 end
 
 function Terminal:_on_pty_readable()
-    while true do
+    -- Limitar cuanto procesamos por invocacion del callback. Con
+    -- 1 GB de output (por ejemplo `seq 1 1000000` x varias veces)
+    -- el while drenaria el PTY sin ceder, sin dejar correr el GC,
+    -- y el heap de LuaJIT crece hasta el OOM kill. En su lugar,
+    -- procesamos a lo sumo 256 KB por tick; si queda mas, el fd
+    -- sigue marcado y volvemos a entrar en el proximo ciclo del
+    -- server (que da tiempo al GC de correr).
+    local budget = 256 * 1024
+    local read_total = 0
+    while read_total < budget do
         local chunk = pty.read(self.pty.fd, 4096)
         if chunk == nil then
             if self.window then self.window:close("shell exit") end
@@ -200,7 +229,16 @@ function Terminal:_on_pty_readable()
         end
         if chunk == "" then break end
         self.term:feed(chunk)
+        read_total = read_total + #chunk
     end
+    -- GC completo despues de cada budget. Un "step" individual no
+    -- alcanza: dentro de vterm_input_write el GC esta en stop, y
+    -- con 64 feeds dentro del budget (256 KB / 4 KB) se acumulan
+    -- decenas de miles de strings temporales. Un step por
+    -- invocacion no los libera. Un collect completo tarda pocos
+    -- ms cada 256 KB; a la velocidad tipica de un PTY eso es
+    -- imperceptible y mantiene el heap acotado.
+    collectgarbage("collect")
 
     -- Afuera del callback FFI: seguro tocar el scrollbar y
     -- redibujar.
@@ -208,6 +246,9 @@ function Terminal:_on_pty_readable()
         self._scrollback_dirty = false
         self:_sync_scrollbar()
     end
+    -- La grilla del vterm pudo haber cambiado: el proximo draw
+    -- tiene que re-leer las celdas.
+    self.renderer:invalidate_snapshot()
     -- NO reseteamos el offset al recibir output. Convencion de
     -- gnome-terminal / kitty / alacritty: mientras el usuario
     -- mira historia, el output nuevo sigue llegando abajo pero el
@@ -407,9 +448,37 @@ function Terminal:_refit()
         self.cols = new_cols
         self.rows = new_rows
         self.term:resize(new_cols, new_rows)
-        pty.resize(self.pty.fd, new_cols, new_rows)
         self:damage()
+        self.renderer:invalidate_snapshot()
+        self:_schedule_pty_resize()
     end
+end
+
+-- El pty.resize se manda con debounce: durante la creacion del
+-- widget, el layout se llama varias veces con tamanos intermedios
+-- antes del definitivo (por ejemplo 98x29, luego 51x30, luego
+-- 112x31). Si mandamos TIOCSWINSZ en cada uno, el PTY termina
+-- con 51x30 en el momento en que la app (htop, vim) abre, y esa
+-- app lee el tamano equivocado al initscr(). SIGWINCH posterior
+-- no siempre la corrije.
+--
+-- 80 ms es suficiente para que los layouts intermedios se
+-- estabilicen sin que el usuario note el delay.
+function Terminal:_schedule_pty_resize()
+    if not self.server or not self.server.add_timeout then
+        -- Sin server (etapa temprana): mandar directo.
+        if self.pty then pty.resize(self.pty.fd, self.cols, self.rows) end
+        return
+    end
+    if self._pty_resize_timer then
+        self._pty_resize_timer:cancel()
+    end
+    self._pty_resize_timer = self.server:add_timeout(80, function()
+        self._pty_resize_timer = nil
+        if self.pty then
+            pty.resize(self.pty.fd, self.cols, self.rows)
+        end
+    end)
 end
 
 function Terminal:layout(x0, y0, x1, y1)
@@ -483,8 +552,77 @@ function Terminal:_cell_at(mx, my)
     return row, col
 end
 
+-- Mods del mouse: bitmask xterm.
+--   4 = shift, 8 = alt, 16 = ctrl
+-- Cacheados: sin cache, cada MotionNotify con mouse reporting hace
+-- un query_keymap sincrono al X server (round-trip + allocs), y
+-- con 60+ eventos/s eso satura un core. El cache dura 50 ms.
+function Terminal:_mouse_mods()
+    if not self.window or not self.window.server then return 0 end
+    local now = timer.now_ms()
+    if (now - self._mods_cache_t) < 50 then
+        return self._mods_cache
+    end
+    local xcb = require("lib.xcb")
+    local km = xcb.query_keymap(self.window.server.conn)
+    local m = 0
+    if km then
+        -- keycodes fisicos: 50=Shift_L, 64=Alt_L, 37=Control_L.
+        if xcb.key_pressed(km, 50) then m = m + 4 end
+        if xcb.key_pressed(km, 64) then m = m + 8 end
+        if xcb.key_pressed(km, 37) then m = m + 16 end
+    end
+    self._mods_cache = m
+    self._mods_cache_t = now
+    return m
+end
+
+-- Genera la secuencia xterm de mouse reporting (formato X10-compat).
+--   ESC [ M <Cb> <Cx> <Cy>
+-- Cb = 32 + button_code + mods (+32 si es movimiento)
+-- Cx = 33 + col  (0-indexado)
+-- Cy = 33 + row
+-- button_code: 0=izq, 1=medio, 2=der, 3=release, 64=rueda arriba,
+--              65=rueda abajo.
+--
+-- No usamos vterm_mouse_move/button de libvterm: en 0.3.3 esas
+-- funciones dependen de un callback mousefunc que no esta
+-- expuesto, y el output se pierde silenciosamente. Generar la
+-- secuencia aca es equivalente y no depende de detalles internos.
+function Terminal:_mouse_seq(button, row, col, is_motion, is_release)
+    if row < 0 then row = 0 end
+    if col < 0 then col = 0 end
+    -- Clamp a 222 para no desbordar el byte (Cx/Cy max = 255).
+    if row > 222 then row = 222 end
+    if col > 222 then col = 222 end
+    local m = self:_mouse_mods()
+    -- Protocolo X10: Cb = 32 + button_code + mods (+32 si motion).
+    -- Release: button_code = 3.
+    local bcode = button
+    if is_release then bcode = 3 end
+    local cb = 32 + bcode + m
+    if is_motion then cb = cb + 32 end
+    local cx = 33 + col
+    local cy = 33 + row
+    return string.char(27, 91, 77, cb, cx, cy)
+end
+
 function Terminal:on_mouse_press(mx, my, button)
     local row, col = self:_cell_at(mx, my)
+    self._mouse_last_row = row
+    self._mouse_last_col = col
+
+    local shift_held = bit.band(self:_mouse_mods(), 4) ~= 0
+    if self._mouse_enabled and not shift_held then
+        if not self.pty then return false end
+        -- X button 1=left, 2=middle, 3=right.
+        local b = button - 1   -- 0=left, 1=middle, 2=right
+        if b < 0 or b > 2 then return true end
+        local seq = self:_mouse_seq(b, row, col, false, false)
+        pty.write(self.pty.fd, seq)
+        return true
+    end
+
     if button == 1 then
         self.sel:start(row, col)
         self._dragging = true
@@ -502,14 +640,62 @@ function Terminal:on_mouse_press(mx, my, button)
 end
 
 function Terminal:on_mouse_move(mx, my)
-    if not self._dragging then return false end
     local row, col = self:_cell_at(mx, my)
+
+    if self._mouse_enabled then
+        local shift_held = bit.band(self:_mouse_mods(), 4) ~= 0
+        if not shift_held then
+            -- Solo emitir motion si el modo lo pide:
+            --   bit 1 (0x02) = drag (mientras boton apretado)
+            --   bit 2 (0x04) = move (cualquier movimiento)
+            -- En modo 1000 (solo click), no emitir nada: sin esto,
+            -- cada MotionNotify hacia un round-trip al X server
+            -- para leer mods. Es lo que causaba el 50% de CPU.
+            local mode = self._mouse_mode or 0
+            local wants_move = bit.band(mode, 0x04) ~= 0
+            local wants_drag = bit.band(mode, 0x02) ~= 0
+            local dragging = self._dragging_mouse
+            if wants_move or (wants_drag and dragging) then
+                if row ~= self._mouse_last_row
+                   or col ~= self._mouse_last_col then
+                    self._mouse_last_row = row
+                    self._mouse_last_col = col
+                    -- button_code = 3 (release) + 32 (motion) en X10.
+                    -- Es lo que esperan los apps para motion.
+                    local seq = self:_mouse_seq(0, row, col, true, false)
+                    if self.pty then pty.write(self.pty.fd, seq) end
+                end
+            end
+        end
+        if not self._dragging then return true end
+    end
+
+    if not self._dragging then return false end
     self.sel:extend(row, col)
     if self.window then self.window:damage_all() end
     return true
 end
 
 function Terminal:on_wheel(direction)
+    -- Si la app pidio mouse reporting, mandarle el scroll como
+    -- boton 4 (arriba) / 5 (abajo) de xterm. Convencion universal.
+    if self._mouse_enabled and self.pty then
+        local shift_held = bit.band(self:_mouse_mods(), 4) ~= 0
+        if not shift_held then
+            -- button_code: 64=up, 65=down. En X10-compat se manda
+            -- press + release (no hay boton fisico que soltar).
+            local code = (direction == 4) and 64 or 65
+            local cx = self._mouse_last_col
+            local cy = self._mouse_last_row
+            local seq_press = string.char(27, 91, 77,
+                32 + code + self:_mouse_mods(), 33 + cx, 33 + cy)
+            local seq_release = string.char(27, 91, 77,
+                32 + 3 + self:_mouse_mods(), 33 + cx, 33 + cy)
+            pty.write(self.pty.fd, seq_press .. seq_release)
+            return true
+        end
+    end
+
     -- 3 lineas por click de rueda. direction 4 = arriba,
     -- 5 = abajo (convencion X11).
     if direction == 4 then
@@ -523,10 +709,23 @@ function Terminal:on_wheel(direction)
 end
 
 function Terminal:on_mouse_release(mx, my, button)
+    local row, col = self:_cell_at(mx, my)
+
+    if self._mouse_enabled then
+        local shift_held = bit.band(self:_mouse_mods(), 4) ~= 0
+        if not shift_held and self.pty then
+            local b = button - 1
+            if b < 0 or b > 2 then return true end
+            local seq = self:_mouse_seq(b, row, col, false, true)
+            pty.write(self.pty.fd, seq)
+            return true
+        end
+        -- Shift apretado: caer al flujo de seleccion local.
+    end
+
     if button ~= 1 then return false end
     if not self._dragging then return false end
     self._dragging = false
-    local row, col = self:_cell_at(mx, my)
     self.sel:extend(row, col)
     self.sel:finish()
     -- Copy-on-select: si hay seleccion, copiar a PRIMARY.
@@ -717,6 +916,9 @@ function Terminal:apply_preferences(prefs)
         end
         self.default_cursor = hex_to_rgb255(prefs.cursor_color)
             or self.default_cursor
+        -- Los colores default cambiaron: el snapshot guardaba
+        -- referencias viejas.
+        self.renderer:invalidate_snapshot()
         self:damage()
         if self.window then self.window:damage_all() end
     end

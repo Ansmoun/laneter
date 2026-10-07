@@ -119,6 +119,13 @@ size_t      vterm_input_write(VTerm *vt, const char *bytes, size_t len);
 void        vterm_keyboard_key(VTerm *vt, int key, int mod);
 void        vterm_keyboard_unichar(VTerm *vt, uint32_t c, int mod);
 
+/* Mouse reporting. 'bool' de C (stdbool.h) es _Bool: 1 byte.
+   LuaJIT lo reconoce como tipo nativo. Declarar 'int' aca rompe
+   el ABI en x86_64 (int ocupa 4 bytes y los pasa por registro
+   distinto a _Bool). */
+void        vterm_mouse_move(VTerm *vt, int row, int col, int mod);
+void        vterm_mouse_button(VTerm *vt, int button, bool pressed, int mod);
+
 void        vterm_output_set_callback(VTerm *vt,
                 void (*func)(const char *s, size_t len, void *user),
                 void *user);
