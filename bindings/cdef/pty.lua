@@ -32,6 +32,7 @@ int   close(int fd);
 long  read(int fd, void *buf, unsigned long count);
 long  write(int fd, const void *buf, unsigned long count);
 int   execvp(const char *file, char *const argv[]);
+void  _exit(int status);
 
 /* Dirent para iterar /proc/self/fd en el hijo. Linux x86_64. */
 typedef struct __dirstream DIR;

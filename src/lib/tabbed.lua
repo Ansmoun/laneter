@@ -21,6 +21,9 @@ local TabsBar     = require("lib.tabs_bar")
 local Divider     = require("lib.divider")
 local Terminal    = require("lib.terminal.widget")
 local ContextMenu = require("lib.widgets.contextmenu")
+local preferences = require("lib.preferences")
+local config      = require("lib.config")
+local kb          = require("lib.keybindings")
 
 local M = {}
 
@@ -282,6 +285,9 @@ function Tabbed:_build_menus()
                       local a = s:active_term()
                       if a then a:set_blink_enabled(not a:is_blink_enabled()) end
                   end },
+                { sep = true },
+                { label = "Preferencias...",
+                  on_click = function() s:open_preferences() end },
             }
         end },
         { label = "Pestañas", build = function() return {
@@ -312,6 +318,35 @@ function Tabbed:_open_menu(anchor, items, on_close)
     })
 end
 
+-- ── Preferencias ──────────────────────────────────────────
+
+function Tabbed:open_preferences()
+    preferences.show {
+        parent_win = self.window,
+        srv        = self.srv,
+        theme      = self.theme,
+        on_apply   = function(prefs)
+            self:_apply_preferences(prefs)
+        end,
+    }
+end
+
+function Tabbed:_apply_preferences(prefs)
+    -- Aplicar en vivo a todas las tabs.
+    for _, t in ipairs(self.tabs) do
+        if t.term and t.term.apply_preferences then
+            t.term:apply_preferences(prefs)
+        end
+    end
+    -- Guardar el shell nuevo para tabs futuras. No afecta a las
+    -- tabs actuales (su PTY ya corre).
+    if prefs.shell ~= nil then
+        self.opts.shell = prefs.shell
+    end
+    log.info("tabbed", "preferencias aplicadas a %d tab(s)",
+        #self.tabs)
+end
+
 -- ── Ciclo de vida ──────────────────────────────────────────
 
 function Tabbed:on_key(key)
@@ -319,20 +354,24 @@ function Tabbed:on_key(key)
     local m = key.mods or {}
     local n = key.name
 
-    -- Atajos de la app (antes de delegar al terminal).
-    if m.ctrl then
-        if n == "t" and not m.shift then
-            self:new_tab()
-            return true
-        end
-        if n == "w" and not m.shift then
-            self:close_tab(self.active_id)
-            return true
-        end
-        if n == "Tab" then
-            if m.shift then self:prev_tab() else self:next_tab() end
-            return true
-        end
+    -- Atajos configurables de la app (antes de delegar al
+    -- terminal).
+    local b = kb.effective()
+    if kb.match(key, b.new_tab) then
+        self:new_tab()
+        return true
+    end
+    if kb.match(key, b.close_tab) then
+        self:close_tab(self.active_id)
+        return true
+    end
+    if kb.match(key, b.next_tab) then
+        self:next_tab()
+        return true
+    end
+    if kb.match(key, b.prev_tab) then
+        self:prev_tab()
+        return true
     end
 
     -- Delegar al terminal activo.

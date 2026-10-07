@@ -7,15 +7,20 @@ local cairo    = require("lib.cairo")
 local log      = require("lib.log")
 local Tabbed   = require("lib.tabbed")
 
-local shell = arg and arg[1] or os.getenv("SHELL") or "/bin/sh"
-log.info("laneter", "shell=%s", shell)
+local shell = arg and arg[1] or nil
+log.info("laneter", "shell CLI=%s", tostring(shell))
 
 local srv = Server.new({ exit_on_empty = false })
 local T = theme.load()
 
+-- shell = nil -> el Terminal usa config.shell o $SHELL.
+-- font  = nil -> el Terminal compone "family size" desde config.
+-- Antes pasaramos un font fijo "DejaVu Sans Mono 11" que pisaba
+-- las preferencias guardadas. Ahora solo respetamos el argumento
+-- de CLI si el usuario lo paso explicitamente.
+local cli_shell = (arg and arg[1]) or nil
 local app = Tabbed.new(srv, T, {
-    shell = shell,
-    font  = "DejaVu Sans Mono 11",
+    shell = cli_shell,
 })
 
 -- El fondo de la Window es el mismo del terminal. Sin esto, en

@@ -111,6 +111,8 @@ end
 
 function Renderer:draw(cr, term, x0, y0, cols, rows, cursor,
                       default_fg, default_bg, is_selected, layout)
+    -- cursor.color (opcional) = {r,g,b} 0-255. Si no viene, usar
+    -- el gris claro clasico.
     local cw, ch = self.cell_w, self.cell_h
 
     -- Paso 1: fondos. Para filas del vterm pintamos bg de cada
@@ -204,7 +206,12 @@ function Renderer:draw(cr, term, x0, y0, cols, rows, cursor,
 
     -- Paso 4: cursor. Bloque semi-transparente encima del caracter.
     if cursor and cursor.visible ~= false then
-        cairo.set_rgba(cr, 0.9, 0.9, 0.9, 0.35)
+        local cc = cursor.color
+        if cc then
+            cairo.set_rgba(cr, cc[1]/255, cc[2]/255, cc[3]/255, 0.55)
+        else
+            cairo.set_rgba(cr, 0.9, 0.9, 0.9, 0.35)
+        end
         cairo.rectangle(cr,
             x0 + cursor.col * cw,
             y0 + cursor.row * ch,

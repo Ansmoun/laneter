@@ -20,30 +20,43 @@ local libc = ffi.load("c")
 
 local M = {}
 
--- Cierra todo fd >= min_fd en el proceso actual. Usa readdir
--- sobre /proc/self/fd para listarlos. Debe llamarse en el hijo
--- tras forkpty.
-local function close_fds_from(min_fd)
+-- Marca todos los fds >= min_fd con FD_CLOEXEC, EXCEPTO los que
+-- estan en except (usualmente el master del PTY, que no queremos
+-- cerrar en el execvp... aunque en realidad forkpty lo cierra en
+-- el hijo de todas formas).
+--
+-- Corre en el PADRE antes del fork. La ventaja: el hijo no tiene
+-- que tocar Lua ni el heap. El kernel se encarga de cerrar los
+-- fds con CLOEXEC al ejecutar el execvp.
+--
+-- Por que hacemos esto: forkpty + LuaJIT es peligroso. Si el GC
+-- del padre estaba corriendo en el momento del fork, el hijo
+-- arranca con heap corrupto. Cualquier uso de FFI o Lua en el
+-- hijo (como listar /proc/self/fd para cerrar) puede reventar.
+-- Con FD_CLOEXEC el hijo hace solo execvp y listo.
+local FD_CLOEXEC = 1
+local F_GETFD = 1
+local F_SETFD = 2
+
+local function mark_fds_cloexec(min_fd, except)
     local dirp = libc.opendir("/proc/self/fd")
-    if dirp == nil then
-        -- Fallback: barrido ciego hasta 256.
-        for i = min_fd, 256 do pcall(libc.close, i) end
-        return
-    end
-    -- Lista de fds a cerrar (no cerrar el DIR* mientras iteramos).
+    if dirp == nil then return end
     local fds = {}
     while true do
         local ent = libc.readdir(dirp)
         if ent == nil then break end
         local name = ffi.string(ent.d_name)
         local n = tonumber(name)
-        if n and n >= min_fd then
+        if n and n >= min_fd and not (except and except[n]) then
             fds[#fds + 1] = n
         end
     end
     libc.closedir(dirp)
     for _, n in ipairs(fds) do
-        pcall(libc.close, n)
+        local flags = libc.fcntl(n, F_GETFD, 0)
+        if flags >= 0 then
+            libc.fcntl(n, F_SETFD, bit.bor(flags, FD_CLOEXEC))
+        end
     end
 end
 
@@ -63,6 +76,14 @@ function M.spawn(shell, cols, rows)
     rows  = rows  or 24
     shell = shell or os.getenv("SHELL") or "/bin/sh"
 
+    -- Marcar TODOS los fds abiertos (excepto stdin/out/err) con
+    -- FD_CLOEXEC. El execvp del hijo los cierra automaticamente.
+    -- El socket de X, signalfd, etc, no pasan al shell.
+    --
+    -- Esto reemplaza el close_fds_from que corria en el hijo. La
+    -- diferencia clave: el hijo ya no toca Lua.
+    mark_fds_cloexec(3)
+
     local master_p = ffi.new("int[1]")
     local ws = ffi.new("struct winsize")
     ws.ws_row = rows
@@ -71,9 +92,10 @@ function M.spawn(shell, cols, rows)
     local pid = libc.forkpty(master_p, nil, nil, ws)
 
     if pid == 0 then
-        -- Hijo. Cerrar fds >= 3 (0/1/2 ya son el slave del PTY).
-        close_fds_from(3)
-
+        -- Hijo. NO tocar Lua mas alla de esto (excepto el execvp).
+        -- El heap Lua puede estar corrupto si el GC estaba
+        -- corriendo en el padre durante el fork.
+        --
         -- argv[0] = "-basename" para forzar modo login shell.
         -- Eso hace que sh lea /etc/profile y ~/.profile.
         local base  = shell:match("[^/]+$") or shell
@@ -81,8 +103,9 @@ function M.spawn(shell, cols, rows)
         local argv  = make_argv({ login })
         libc.execvp(shell, argv)
 
-        -- execvp fallo: salir con 127.
-        os.exit(127)
+        -- execvp fallo. Usar _exit (syscall directa) para saltarse
+        -- finalizers de LuaJIT en el hijo.
+        ffi.C._exit(127)
     end
 
     if pid < 0 then

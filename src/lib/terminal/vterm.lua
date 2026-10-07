@@ -88,31 +88,46 @@ end
 
 -- Callback: una linea sale por arriba del viewport. libvterm la
 -- pasa como array de celdas de tamano 'cols'.
+-- Callbacks FFI planos (sin anidar closures). LuaJIT castea
+-- estos closures a function pointers C: cada uno captura SOLO
+-- _handlers (upvalue compartido del modulo). Nada de safe(fn):
+-- anidar un closure dentro de otro rompe el trampolin FFI en
+-- algunos casos y el GC libera el interno.
+--
+-- El pcall va adentro: si algo falla, el error queda en stderr
+-- y devolvemos 0. No protege de un callback recolectado (eso lo
+-- evita _cb_keepalive y el id poblado a tiempo en M.new), pero
+-- protege de cualquier error de Lua en la logica interna.
 _cb_keepalive.pushline = function(cols, cells, user)
-    local id = tonumber(ffi.cast("intptr_t", user))
-    local h = _handlers[id]
-    if h and h.on_pushline then
-        local text = cells_to_utf8(cells, cols)
-        -- libvterm rellena las celdas no escritas de la fila con
-        -- espacios. Los quitamos del final: son padding, no
-        -- contenido. Espacios iniciales (indentacion) se respetan.
-        text = text:gsub("%s+$", "")
-        h.on_pushline(text, cols)
+    local ok, err = pcall(function()
+        local id = tonumber(ffi.cast("intptr_t", user))
+        local h = _handlers[id]
+        if h and h.on_pushline then
+            local text = cells_to_utf8(cells, cols)
+            text = text:gsub("%s+$", "")
+            h.on_pushline(text, cols)
+        end
+    end)
+    if not ok then
+        io.stderr:write("[vterm pushline] " .. tostring(err) .. "\n")
     end
     return 0
 end
 
 _cb_keepalive.popline = function(cols, cells, user)
-    -- No soportamos pop todavia (no re-scrolleamos lineas devuelta
-    -- al viewport). Devolver 0 indica a libvterm que no tomamos
-    -- la linea.
+    -- No soportamos pop todavia.
     return 0
 end
 
 _cb_keepalive.clear = function(user)
-    local id = tonumber(ffi.cast("intptr_t", user))
-    local h = _handlers[id]
-    if h and h.on_clear then h.on_clear() end
+    local ok, err = pcall(function()
+        local id = tonumber(ffi.cast("intptr_t", user))
+        local h = _handlers[id]
+        if h and h.on_clear then h.on_clear() end
+    end)
+    if not ok then
+        io.stderr:write("[vterm clear] " .. tostring(err) .. "\n")
+    end
     return 0
 end
 
@@ -195,21 +210,27 @@ function M.new(cols, rows)
 
     local state = lib.vterm_obtain_state(vt)
 
-    -- Reset inicial para aplicar la configuracion.
-    lib.vterm_state_reset(state, 1)
-    lib.vterm_screen_reset(screen, 1)
-
+    -- Poblar el handler ANTES de cualquier reset. Los resets
+    -- pueden disparar callbacks (por ejemplo sb_clear). Si el
+    -- handler no esta todavia en _handlers, el callback corre con
+    -- h = nil y no hace nada, pero cualquier carrera con el GC
+    -- del trampolin puede dejar el cdata de la cbs en mal estado.
     local self = setmetatable({
         vt = vt, screen = screen, state = state,
         cols = cols, rows = rows,
         _id = my_id,
-        -- IMPORTANTE: mantener viva la struct de callbacks. libvterm
-        -- guarda el puntero internamente, pero LuaJIT no ve la
-        -- referencia desde su lado; sin esta linea, el GC la libera
-        -- y el proximo callback lee memoria invalida (segfault).
+        -- Mantener viva la struct de callbacks. libvterm guarda el
+        -- puntero internamente; sin esta referencia, el GC puede
+        -- liberar la cdata y el siguiente callback lee memoria
+        -- invalida -> "bad callback".
         _cbs = cbs,
     }, VTermHandle)
     _handlers[my_id] = self
+
+    -- Reset inicial para aplicar la configuracion.
+    lib.vterm_state_reset(state, 1)
+    lib.vterm_screen_reset(screen, 1)
+
     return self
 end
 
@@ -230,7 +251,21 @@ end
 
 function VTermHandle:feed(bytes)
     if type(bytes) ~= "string" or #bytes == 0 then return end
+    -- CRITICO: vterm_input_write puede disparar decenas de miles
+    -- de callbacks FFI (sb_pushline por cada linea que sale del
+    -- viewport). Si el GC de LuaJIT corre en medio del trampolin
+    -- FFI, lo invalida y el proceso muere con "bad callback".
+    --
+    -- Con buffers grandes (por ejemplo `seq 1 500000`, ~3 MB),
+    -- el GC corre seguido porque cells_to_utf8 y text:gsub
+    -- allocan strings temporales por linea. Deshabilitar el GC
+    -- durante el write elimina la clase entera de crash. Se
+    -- reactiva al volver: el GC no acumula basura mas alla de lo
+    -- que generen los propios callbacks, y el buffer se drena
+    -- rapido.
+    collectgarbage("stop")
     lib.vterm_input_write(self.vt, bytes, #bytes)
+    collectgarbage("restart")
     lib.vterm_screen_flush_damage(self.screen)
 end
 

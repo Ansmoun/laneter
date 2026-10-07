@@ -20,6 +20,8 @@ local render = require("lib.terminal.render")
 local keys   = require("lib.terminal.keys")
 local Sel    = require("lib.terminal.selection")
 local clip   = require("lib.terminal.clipboard")
+local config = require("lib.config")
+local kb     = require("lib.keybindings")
 
 local M = {}
 
@@ -46,12 +48,37 @@ function M.new(opts)
     local self = setmetatable(Area.new({}), Terminal)
 
     self.opts = opts
-    self.shell = opts.shell or os.getenv("SHELL") or "/bin/sh"
-    self.default_font = opts.font or DEFAULT_FONT
+
+    -- Preferencias: opts explicitos > config > defaults.
+    -- Permite que un consumidor (tabbed) pase opts.shell, opts.font
+    -- desde el mismo config, y que ademas opts.overrides (del
+    -- preferences) tengan la ultima palabra cuando se aplican en
+    -- caliente.
+    local cfg_family = config.get("font_family") or "DejaVu Sans Mono"
+    local cfg_size   = tonumber(config.get("font_size")) or 11
+    local cfg_shell  = config.get("shell")   -- puede ser nil
+    local cfg_sb     = tonumber(config.get("scrollback_lines")) or 2000
+    local cfg_blink  = config.get("cursor_blink")
+    if cfg_blink == nil then cfg_blink = true end
+
+    -- Cuidado: "" es truthy en Lua. Un input vacio en Preferencias
+    -- guarda "" como shell, y execvp("") falla con ENOENT: el
+    -- hijo muere al instante, PTY devuelve POLLHUP, y el server
+    -- cierra la app entera. Normalizar "" -> nil.
+    local function nn(v) return (v ~= nil and v ~= "") and v or nil end
+    self.shell = nn(opts.shell) or nn(cfg_shell)
+        or os.getenv("SHELL") or "/bin/sh"
+    self.default_font = opts.font
+        or (cfg_family .. " " .. cfg_size)
     self.font = self.default_font
     self.renderer = render.new(self.font)
     self.cols = 80
     self.rows = 24
+
+    -- Scrollback maximo desde config (puede cambiar en runtime via
+    -- apply_preferences).
+    SCROLLBACK_LINES = cfg_sb
+    self._initial_blink = cfg_blink and true or false
 
     -- Scrollback: array circular de strings (una linea de texto
     -- por elemento). 'head' apunta al proximo slot a escribir,
@@ -59,7 +86,7 @@ function M.new(opts)
     self.scrollback      = {}
     self.scrollback_head = 1
     self.scrollback_count = 0
-    self.scrollback_max  = SCROLLBACK_LINES
+    self.scrollback_max  = SCROLLBACK_LINES  -- se puede cambiar luego
 
     self.term = vterm.new(self.cols, self.rows)
     assert(self.term, "vterm.new fallo")
@@ -82,17 +109,42 @@ function M.new(opts)
     log.info("terminal", "PTY abierto: pid=%d fd=%d", h.pid, h.fd)
     log.info("terminal", "font: %s", self.font)
 
+    -- Colores. Orden de precedencia: opts explicitos > config >
+    -- theme de LANE > defaults hardcoded. Si config.color_mode es
+    -- "theme", usar los del theme; si es "custom", usar los hex de
+    -- config.text_color/bg_color/cursor_color.
     local T = opts.theme or {}
-    self.default_fg = T.fg_rgb
-        and { T.fg_rgb[1]*255, T.fg_rgb[2]*255, T.fg_rgb[3]*255 }
-        or DEFAULT_FG
-    self.default_bg = T.bg_rgb
-        and { T.bg_rgb[1]*255, T.bg_rgb[2]*255, T.bg_rgb[3]*255 }
-        or DEFAULT_BG
+    local cfg_mode   = config.get("color_mode") or "theme"
+    local cfg_fg_hex = config.get("text_color")
+    local cfg_bg_hex = config.get("bg_color")
+    local cfg_cur_hex = config.get("cursor_color")
+
+    local function hex_to_rgb255(hex)
+        if not hex or hex == "" then return nil end
+        local G = require("lib.helpers.graphics")
+        local ok, r, g, b = pcall(G.hex_to_rgba, hex)
+        if not ok or r == nil then return nil end
+        return { math.floor(r*255), math.floor(g*255), math.floor(b*255) }
+    end
+
+    if cfg_mode == "custom" then
+        self.default_fg = opts.fg or hex_to_rgb255(cfg_fg_hex) or DEFAULT_FG
+        self.default_bg = opts.bg or hex_to_rgb255(cfg_bg_hex) or DEFAULT_BG
+    else
+        self.default_fg = opts.fg
+            or (T.fg_rgb and { T.fg_rgb[1]*255, T.fg_rgb[2]*255, T.fg_rgb[3]*255 })
+            or DEFAULT_FG
+        self.default_bg = opts.bg
+            or (T.bg_rgb and { T.bg_rgb[1]*255, T.bg_rgb[2]*255, T.bg_rgb[3]*255 })
+            or DEFAULT_BG
+    end
+    self._theme = T
+    self.default_cursor = hex_to_rgb255(cfg_cur_hex)
+        or { 230, 230, 230 }
 
     self.sel = Sel.new()
     self._cursor_visible = true
-    self._blink_enabled = true
+    self._blink_enabled = self._initial_blink
     self._dragging = false
     -- 0 = en vivo (viewport sigue al vterm). Positivo = cuantas
     -- filas hacia atras estamos mirando en el scrollback.
@@ -400,6 +452,7 @@ function Terminal:draw(cr)
         visible = (not in_sb)
             and self._cursor_visible
             and self.sel:is_empty(),
+        color = self.default_cursor,
     }
 
     local selected = nil
@@ -508,34 +561,18 @@ function Terminal:on_key(key)
     local n = key.name
     local m = key.mods or {}
 
-    -- ── Copy/paste (defaults estandar de terminal) ──
-    -- Ctrl+Shift+C copia la seleccion.
-    -- Ctrl+Shift+V pega del CLIPBOARD.
-    -- Ctrl+Insert / Shift+Insert son aliases tradicionales.
-    -- Ctrl+C / Ctrl+V NO se tocan: van al shell (SIGINT y quoted
-    -- insert de readline). Si el usuario quiere invertirlos, va
-    -- por local_overrides.
-    if m.ctrl and m.shift and (n == "c" or n == "C") then
-        local text = self.sel:get_text(self.term, self.cols)
-        if text and text ~= "" then
-            clip.copy_to("clipboard", text)
-            log.info("terminal", "copy %d bytes", #text)
-        end
-        return true
-    end
-    if m.ctrl and m.shift and (n == "v" or n == "V") then
-        local text = clip.paste_from("clipboard")
-        if text then
-            pty.write(self.pty.fd, text)
-            log.info("terminal", "paste %d bytes", #text)
-        end
-        return true
-    end
+    -- ── Atajos configurables ──
+    -- El binding efectivo viene de config.keybindings pisado por
+    -- los defaults. Los modificadores solos (Control_L, Shift_L)
+    -- no matchean ningun combo, asi que el flujo sigue.
+    local b = kb.effective()
+
+    -- Aliases tradicionales que no son configurables (Ctrl+Insert
+    -- y Shift+Insert). Se mantienen porque son parte del estandar
+    -- X11 y casi nadie los reasigna.
     if m.ctrl and not m.shift and (n == "Insert") then
         local text = self.sel:get_text(self.term, self.cols)
-        if text and text ~= "" then
-            clip.copy_to("clipboard", text)
-        end
+        if text and text ~= "" then clip.copy_to("clipboard", text) end
         return true
     end
     if m.shift and not m.ctrl and (n == "Insert") then
@@ -544,52 +581,64 @@ function Terminal:on_key(key)
         return true
     end
 
-    -- ── Scrollback ──
-    -- Shift+PageUp / Shift+PageDown: una pantalla menos 1 fila
-    -- (para tener una linea de solapamiento, ayuda a seguir).
-    if m.shift and not m.ctrl then
-        local step = self.rows - 1
-        if step < 1 then step = 1 end
-        if n == "Prior" or n == "Page_Up" then
-            self:scrollback_up(step)
-            return true
-        elseif n == "Next" or n == "Page_Down" then
-            self:scrollback_down(step)
-            return true
+    -- Copy.
+    if kb.match(key, b.copy) then
+        local text = self.sel:get_text(self.term, self.cols)
+        if text and text ~= "" then
+            clip.copy_to("clipboard", text)
+            log.info("terminal", "copy %d bytes", #text)
         end
+        return true
     end
-    -- Ctrl+Home: ir al principio del historial.
-    -- Ctrl+End: volver al presente.
-    if m.ctrl and not m.shift then
-        if n == "Home" then
-            self:scrollback_top()
-            return true
-        elseif n == "End" then
-            self:scrollback_bottom()
-            return true
+    -- Paste.
+    if kb.match(key, b.paste) then
+        local text = clip.paste_from("clipboard")
+        if text then
+            pty.write(self.pty.fd, text)
+            log.info("terminal", "paste %d bytes", #text)
         end
+        return true
     end
 
-    -- ── Tamaño de fuente ──
-    if m.ctrl and not m.alt and not m.super then
-        if n == "plus" or n == "KP_Add"
-           or n == "equal" or n == "asterisk" then
-            self:adjust_font_size(1)
-            return true
-        elseif n == "minus" or n == "KP_Subtract" or n == "underscore" then
-            self:adjust_font_size(-1)
-            return true
-        elseif n == "0" or n == "KP_0" or n == "parenright" then
-            self:reset_font_size()
-            return true
-        end
+    -- Scrollback.
+    if kb.match(key, b.scrollback_up) then
+        local step = self.rows - 1
+        if step < 1 then step = 1 end
+        self:scrollback_up(step)
+        return true
+    end
+    if kb.match(key, b.scrollback_down) then
+        local step = self.rows - 1
+        if step < 1 then step = 1 end
+        self:scrollback_down(step)
+        return true
+    end
+    if kb.match(key, b.scrollback_top) then
+        self:scrollback_top()
+        return true
+    end
+    if kb.match(key, b.scrollback_bot) then
+        self:scrollback_bottom()
+        return true
+    end
+
+    -- Fuente.
+    if kb.match(key, b.font_bigger) then
+        self:adjust_font_size(1)
+        return true
+    end
+    if kb.match(key, b.font_smaller) then
+        self:adjust_font_size(-1)
+        return true
+    end
+    if kb.match(key, b.font_reset) then
+        self:reset_font_size()
+        return true
     end
 
     -- Traducir primero. Modificadores solos (Control_L, Shift_L,
     -- Alt_L, Super_L) no traducen y salen por aca sin limpiar la
-    -- seleccion. Antes se limpiaba ANTES de traducir, y entonces
-    -- al apretar Ctrl (para hacer Ctrl+C) se borraba la seleccion
-    -- antes de que llegara la 'c'.
+    -- seleccion.
     local tr = keys.translate(key)
     if not tr then return false end
 
@@ -617,6 +666,91 @@ function Terminal:on_key(key)
         pty.write(self.pty.fd, bytes)
     end
     return true
+end
+
+-- Aplica preferencias nuevas sin recrear el objeto. Actualiza
+-- fuente (rebuild del renderer + refit), blink, scrollback maximo.
+-- El shell NO se puede cambiar en vivo (el PTY ya esta corriendo).
+-- Un cambio de shell requiere nueva tab.
+function Terminal:apply_preferences(prefs)
+    if not prefs then return end
+
+    -- Fuente.
+    if prefs.font_family and prefs.font_size then
+        local new_font = prefs.font_family .. " " .. tostring(prefs.font_size)
+        if new_font ~= self.font then
+            self:_set_font(new_font)
+        end
+    end
+
+    -- Cursor parpadea.
+    if prefs.cursor_blink ~= nil then
+        self:set_blink_enabled(prefs.cursor_blink)
+    end
+
+    -- Colores. Recalcular default_fg/default_bg segun modo.
+    if prefs.color_mode ~= nil
+       or prefs.text_color ~= nil
+       or prefs.bg_color ~= nil
+       or prefs.cursor_color ~= nil then
+        local T = self._theme or {}
+        local function hex_to_rgb255(hex)
+            if not hex or hex == "" then return nil end
+            local G = require("lib.helpers.graphics")
+            local ok, r, g, b = pcall(G.hex_to_rgba, hex)
+            if not ok or r == nil then return nil end
+            return { math.floor(r*255), math.floor(g*255), math.floor(b*255) }
+        end
+        local mode = prefs.color_mode or "theme"
+        if mode == "custom" then
+            self.default_fg = hex_to_rgb255(prefs.text_color)
+                or self.default_fg or DEFAULT_FG
+            self.default_bg = hex_to_rgb255(prefs.bg_color)
+                or self.default_bg or DEFAULT_BG
+        else
+            self.default_fg = (T.fg_rgb
+                and { T.fg_rgb[1]*255, T.fg_rgb[2]*255, T.fg_rgb[3]*255 })
+                or DEFAULT_FG
+            self.default_bg = (T.bg_rgb
+                and { T.bg_rgb[1]*255, T.bg_rgb[2]*255, T.bg_rgb[3]*255 })
+                or DEFAULT_BG
+        end
+        self.default_cursor = hex_to_rgb255(prefs.cursor_color)
+            or self.default_cursor
+        self:damage()
+        if self.window then self.window:damage_all() end
+    end
+
+    -- Scrollback maximo. Si el nuevo es menor que el actual,
+    -- descartamos las lineas mas viejas.
+    if prefs.scrollback_lines then
+        local new_max = math.floor(prefs.scrollback_lines)
+        if new_max < 100 then new_max = 100 end
+        if new_max ~= self.scrollback_max then
+            if new_max < self.scrollback_count then
+                -- Reconstruir el buffer con las ultimas new_max lineas.
+                local kept = {}
+                for i = 1, new_max do
+                    kept[i] = self:scrollback_line(i)
+                end
+                -- kept[1] es la mas reciente. Guardar en orden inverso.
+                self.scrollback = {}
+                self.scrollback_head = 1
+                self.scrollback_count = 0
+                for i = new_max, 1, -1 do
+                    self.scrollback[self.scrollback_head] = kept[i]
+                    self.scrollback_head = (self.scrollback_head % new_max) + 1
+                    self.scrollback_count = self.scrollback_count + 1
+                end
+                if self.scrollback_offset > self.scrollback_count then
+                    self.scrollback_offset = self.scrollback_count
+                end
+            end
+            self.scrollback_max = new_max
+            self._sync_scrollbar()
+            if self.window then self.window:damage_all() end
+        end
+    end
 end
 
 function Terminal:destroy()
