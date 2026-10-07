@@ -5,7 +5,7 @@ local Window   = require("lib.window")
 local theme    = require("lib.theme")
 local cairo    = require("lib.cairo")
 local log      = require("lib.log")
-local Terminal = require("lib.terminal.widget")
+local Tabbed   = require("lib.tabbed")
 
 local shell = arg and arg[1] or os.getenv("SHELL") or "/bin/sh"
 log.info("laneter", "shell=%s", shell)
@@ -13,20 +13,17 @@ log.info("laneter", "shell=%s", shell)
 local srv = Server.new({ exit_on_empty = false })
 local T = theme.load()
 
-local term = Terminal.new {
+local app = Tabbed.new(srv, T, {
     shell = shell,
-    theme = T,
     font  = "DejaVu Sans Mono 11",
-}
+})
 
--- El buffer de la Window NO se limpia solo. Si no pintamos el
--- fondo completo en on_draw, quedan restos de frames previos o
--- de otras ventanas que se solaparon durante el mapeo (bug
--- observado con lane-bar sobre laneter). El color de fondo es el
--- mismo que usa el Terminal, para que no haya diferencia visible
--- entre el fondo del widget y el fondo de la Window.
+-- El fondo de la Window es el mismo del terminal. Sin esto, en
+-- el momento del mapeo la Window muestra basura del buffer (se
+-- ve como restos de otras ventanas superpuestas).
 local function bg_color()
-    local c = term.default_bg
+    local t = app:active_term()
+    local c = (t and t.default_bg) or { 20, 20, 24 }
     return c[1]/255, c[2]/255, c[3]/255
 end
 
@@ -44,22 +41,19 @@ win = Window.new(srv, {
         cairo.fill(cr)
     end,
     on_key = function(key)
-        if term:on_key(key) then return end
-        if key.pressed and key.name == "Escape"
-           and not key.mods.ctrl
-           and not key.mods.alt
-           and not key.mods.super then
-            win:close("escape")
-        end
+        if app:on_key(key) then return end
+        -- Sin fallback de Escape: se usa dentro del shell (vim,
+        -- etc). Para cerrar la ventana: mod+shift+q del WM, o
+        -- Archivo -> Cerrar ventana.
     end,
     on_close = function()
-        term:destroy()
+        app:destroy()
         srv:stop()
     end,
 })
 
 log.info("laneter", "Window creada, set_root")
-win:set_root(term)
+win:set_root(app.widget)
 log.info("laneter", "set_root OK")
 
 srv:run()

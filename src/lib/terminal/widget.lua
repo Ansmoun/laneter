@@ -33,6 +33,7 @@ local DEFAULT_FONT = "DejaVu Sans Mono 11"
 local MIN_SIZE = 6
 local MAX_SIZE = 32
 local CURSOR_BLINK_MS = 500
+local SCROLLBACK_LINES = 2000
 
 local function fill_bg(cr, x, y, w, h, bg)
     cairo.set_rgb(cr, bg[1] / 255, bg[2] / 255, bg[3] / 255)
@@ -52,8 +53,28 @@ function M.new(opts)
     self.cols = 80
     self.rows = 24
 
+    -- Scrollback: array circular de strings (una linea de texto
+    -- por elemento). 'head' apunta al proximo slot a escribir,
+    -- 'count' cuenta cuantas lineas hay actualmente (0..MAX).
+    self.scrollback      = {}
+    self.scrollback_head = 1
+    self.scrollback_count = 0
+    self.scrollback_max  = SCROLLBACK_LINES
+
     self.term = vterm.new(self.cols, self.rows)
     assert(self.term, "vterm.new fallo")
+
+    -- Registrar callbacks de scrollback.
+    self.term:set_scrollback_callbacks {
+        on_pushline = function(text, cols)
+            self:_push_scrollback_line(text)
+        end,
+        on_clear = function()
+            self.scrollback = {}
+            self.scrollback_head = 1
+            self.scrollback_count = 0
+        end,
+    }
 
     local h, err = pty.spawn(self.shell, self.cols, self.rows)
     assert(h, err or "pty.spawn fallo")
@@ -71,7 +92,11 @@ function M.new(opts)
 
     self.sel = Sel.new()
     self._cursor_visible = true
+    self._blink_enabled = true
     self._dragging = false
+    -- 0 = en vivo (viewport sigue al vterm). Positivo = cuantas
+    -- filas hacia atras estamos mirando en el scrollback.
+    self.scrollback_offset = 0
 
     self.min_w, self.max_w = 100, 10000
     self.min_h, self.max_h = 50, 10000
@@ -79,6 +104,12 @@ function M.new(opts)
 end
 
 function Terminal:set_window(win)
+    -- Idempotente: en new_tab se llama explicito Y el Stack
+    -- propaga, registrando el fd dos veces. Con el guard, solo el
+    -- primer llamado tiene efecto.
+    if self._registered_window == win then return end
+    self._registered_window = win
+
     if Area.set_window then Area.set_window(self, win) end
     self.window = win
     self.server = win.server
@@ -87,10 +118,25 @@ function Terminal:set_window(win)
     if win.server.add_timer then
         self._cursor_timer = win.server:add_timer(CURSOR_BLINK_MS,
             function()
+                if not self._blink_enabled then return end
                 self._cursor_visible = not self._cursor_visible
                 if self.window then self.window:damage_all() end
             end)
     end
+end
+
+-- Activa/desactiva el parpadeo. Cuando esta desactivado, el
+-- cursor queda siempre visible.
+function Terminal:set_blink_enabled(v)
+    self._blink_enabled = v and true or false
+    if not self._blink_enabled then
+        self._cursor_visible = true
+        if self.window then self.window:damage_all() end
+    end
+end
+
+function Terminal:is_blink_enabled()
+    return self._blink_enabled
 end
 
 function Terminal:_on_pty_readable()
@@ -103,16 +149,192 @@ function Terminal:_on_pty_readable()
         if chunk == "" then break end
         self.term:feed(chunk)
     end
-    -- Limpiar seleccion al recibir output (evita que quede
-    -- apuntando a posiciones que ya no existen).
-    if not self.sel:is_empty() and not self.sel.active then
-        -- La dejamos. Es util poder copiar despues de que el
-        -- comando termino. Solo limpiamos si el usuario empezo a
-        -- escribir (ver on_key).
+
+    -- Afuera del callback FFI: seguro tocar el scrollbar y
+    -- redibujar.
+    if self._scrollback_dirty then
+        self._scrollback_dirty = false
+        self:_sync_scrollbar()
     end
+    -- NO reseteamos el offset al recibir output. Convencion de
+    -- gnome-terminal / kitty / alacritty: mientras el usuario
+    -- mira historia, el output nuevo sigue llegando abajo pero el
+    -- viewport no salta. El usuario vuelve al presente con
+    -- Ctrl+End, rueda hacia abajo, o escribiendo.
+    --
+    -- Antes saltabamos al vivo cuando llegaba output, y eso
+    -- rompia el drag de la scrollbar: llegaba un byte del `seq`,
+    -- el offset volvia a 0, el SB se sincronizaba, el usuario
+    -- seguia arrastrando, nueva pelea. Resultado: texto sin
+    -- renderizar.
     self._cursor_visible = true
     self:damage()
     if self.window then self.window:damage_all() end
+end
+
+-- ── Scrollback ─────────────────────────────────────────────
+
+-- IMPORTANTE: este metodo se invoca DESDE dentro del callback
+-- FFI de libvterm (sb_pushline), en medio de vterm_input_write.
+-- NO tocar el ScrollBar ni llamar damage desde aca: si lo
+-- hacemos, self:damage() puede disparar un draw que vuelve a
+-- entrar a libvterm (term:cell) mientras libvterm todavia esta
+-- procesando -> "bad callback" de LuaJIT. El sync del scrollbar
+-- se hace desde _on_pty_readable, afuera del callback.
+function Terminal:_push_scrollback_line(text)
+    self.scrollback[self.scrollback_head] = text
+    self.scrollback_head = (self.scrollback_head % self.scrollback_max) + 1
+    if self.scrollback_count < self.scrollback_max then
+        self.scrollback_count = self.scrollback_count + 1
+    end
+    self._scrollback_dirty = true
+    self._layout_cache = nil   -- invalidar layout
+end
+
+-- Devuelve la linea N-esima contada desde el final del scrollback.
+-- idx = 1 es la mas reciente. Fuera de rango devuelve "".
+function Terminal:scrollback_line(idx)
+    if idx < 1 or idx > self.scrollback_count then return "" end
+    -- Formula wrap 1-indexed. head apunta al proximo hueco.
+    -- La linea idx mas reciente esta en (head - idx), mapeado a
+    -- [1, max]. El -1 / +1 evita el caso pos==0 (cuando
+    -- head==idx, la linea mas nueva esta en el ultimo slot antes
+    -- del wrap).
+    local pos = ((self.scrollback_head - idx - 1) % self.scrollback_max) + 1
+    return self.scrollback[pos] or ""
+end
+
+function Terminal:scrollback_size()
+    return self.scrollback_count
+end
+
+-- ── Navegacion del scrollback ─────────────────────────────
+
+-- Cuantas filas podemos scrollear hacia arriba.
+function Terminal:scrollback_max_offset()
+    return self.scrollback_count
+end
+
+function Terminal:scrollback_up(n)
+    n = n or 1
+    local max = self:scrollback_max_offset()
+    local new = self.scrollback_offset + n
+    if new > max then new = max end
+    if new ~= self.scrollback_offset then
+        self.scrollback_offset = new
+        self:_sync_scrollbar()
+        if self.window then self.window:damage_all() end
+    end
+end
+
+function Terminal:scrollback_down(n)
+    n = n or 1
+    local new = self.scrollback_offset - n
+    if new < 0 then new = 0 end
+    if new ~= self.scrollback_offset then
+        self.scrollback_offset = new
+        self:_sync_scrollbar()
+        if self.window then self.window:damage_all() end
+    end
+end
+
+function Terminal:scrollback_top()
+    self.scrollback_offset = self:scrollback_max_offset()
+    self:_sync_scrollbar()
+    if self.window then self.window:damage_all() end
+end
+
+function Terminal:scrollback_bottom()
+    self.scrollback_offset = 0
+    self:_sync_scrollbar()
+    if self.window then self.window:damage_all() end
+end
+
+-- Conecta un ScrollBar externo (de LaneTK). El SB es la fuente
+-- de verdad del offset "del lado del usuario" (0 = arriba). El
+-- Terminal traduce a su scrollback_offset (0 = vivo, N = atras).
+function Terminal:set_scrollbar(sb)
+    self._scrollbar = sb
+    sb:on_change(function(new_sb_offset)
+        -- IMPORTANTE: el ScrollBar calcula el offset con
+        -- drag_base + (delta / range) * offset_max -> float.
+        -- Si ese float llega a scrollback_line(), el indice
+        -- self.scrollback[1999.7] es nil en Lua (no hay claves
+        -- float en una tabla con claves enteras) y devuelve "".
+        -- Resultado: filas vacias en medio del scrollback.
+        -- Redondear y clampear antes de asignar.
+        local new_off = self.scrollback_count - new_sb_offset
+        if new_off < 0 then new_off = 0 end
+        if new_off > self.scrollback_count then
+            new_off = self.scrollback_count
+        end
+        new_off = math.floor(new_off + 0.5)
+        if new_off ~= self.scrollback_offset then
+            self.scrollback_offset = new_off
+            self:damage()
+            if self.window then self.window:damage_all() end
+        end
+    end)
+    self:_sync_scrollbar()
+end
+
+-- Empuja el estado del scrollback al ScrollBar. silent = true
+-- porque somos nosotros los que movemos, no el usuario: no hay
+-- que disparar su on_change (seria loop).
+function Terminal:_sync_scrollbar()
+    if not self._scrollbar then return end
+    self._scrollbar:set_offset_max(self.scrollback_count)
+    local sb_offset = self.scrollback_count - self.scrollback_offset
+    if sb_offset < 0 then sb_offset = 0 end
+    self._scrollbar:set_offset(sb_offset, true)
+end
+
+-- Construye el row_layout para el renderer segun el offset.
+-- Devuelve nil si estamos en vivo (draw usa el camino rapido).
+--
+-- Cacheado por (offset, count, rows): solo se reconstruye cuando
+-- cambian. Durante scroll continuo, el offset cambia cada frame
+-- pero el costo por frame pasa de ~40 tablas nuevas a 1
+-- (invalidacion + reconstruccion).
+function Terminal:_build_scrollback_layout()
+    if self.scrollback_offset == 0 then
+        self._layout_cache = nil
+        return nil
+    end
+    -- Defensa: forzar enteros y clampear. Si algo deja pasar un
+    -- float, scrollback_line() devolveria "" para indices
+    -- fraccionarios (nil en la tabla).
+    local n = math.floor(self.scrollback_offset + 0.5)
+    if n < 0 then n = 0 end
+    if n > self.scrollback_count then n = self.scrollback_count end
+    local total = self.scrollback_count
+    local rows = self.rows
+    local cache = self._layout_cache
+    if cache and cache.n == n and cache.total == total
+       and cache.rows == rows then
+        return cache.layout
+    end
+
+    local layout = {}
+    for vy = 0, rows - 1 do
+        local buffer_row = total - n + vy
+        if buffer_row < 0 then
+            layout[vy + 1] = { source = "scrollback", text = "" }
+        elseif buffer_row < total then
+            local idx = total - buffer_row
+            layout[vy + 1] = {
+                source = "scrollback",
+                text = self:scrollback_line(idx),
+            }
+        else
+            local vrow = buffer_row - total
+            layout[vy + 1] = { source = "vterm", row = vrow }
+        end
+    end
+    self._layout_cache = {
+        n = n, total = total, rows = rows, layout = layout,
+    }
+    return layout
 end
 
 function Terminal:askMinMax(minw, minh, maxw, maxh)
@@ -168,22 +390,30 @@ function Terminal:draw(cr)
     fill_bg(cr, self.x0, self.y0, self:getWidth(), self:getHeight(),
         self.default_bg)
 
+    -- En modo scrollback el cursor no se muestra (estamos viendo
+    -- historia, no la fila viva). En modo live, respeta blink y
+    -- la ausencia de seleccion.
+    local in_sb = self.scrollback_offset > 0
     local cursor = self.term:cursor()
     local cursor_vis = {
         row = cursor.row, col = cursor.col,
-        visible = self._cursor_visible and self.sel:is_empty(),
+        visible = (not in_sb)
+            and self._cursor_visible
+            and self.sel:is_empty(),
     }
 
     local selected = nil
-    if not self.sel:is_empty() then
+    if not in_sb and not self.sel:is_empty() then
         selected = function(r, c) return self.sel:contains(r, c) end
     end
+
+    local layout = self:_build_scrollback_layout()
 
     self.renderer:draw(cr, self.term,
         self.x0, self.y0, self.cols, self.rows,
         cursor_vis,
         self.default_fg, self.default_bg,
-        selected)
+        selected, layout)
 end
 
 -- ── Mouse ──────────────────────────────────────────────────
@@ -224,6 +454,19 @@ function Terminal:on_mouse_move(mx, my)
     self.sel:extend(row, col)
     if self.window then self.window:damage_all() end
     return true
+end
+
+function Terminal:on_wheel(direction)
+    -- 3 lineas por click de rueda. direction 4 = arriba,
+    -- 5 = abajo (convencion X11).
+    if direction == 4 then
+        self:scrollback_up(3)
+        return true
+    elseif direction == 5 then
+        self:scrollback_down(3)
+        return true
+    end
+    return false
 end
 
 function Terminal:on_mouse_release(mx, my, button)
@@ -301,6 +544,32 @@ function Terminal:on_key(key)
         return true
     end
 
+    -- ── Scrollback ──
+    -- Shift+PageUp / Shift+PageDown: una pantalla menos 1 fila
+    -- (para tener una linea de solapamiento, ayuda a seguir).
+    if m.shift and not m.ctrl then
+        local step = self.rows - 1
+        if step < 1 then step = 1 end
+        if n == "Prior" or n == "Page_Up" then
+            self:scrollback_up(step)
+            return true
+        elseif n == "Next" or n == "Page_Down" then
+            self:scrollback_down(step)
+            return true
+        end
+    end
+    -- Ctrl+Home: ir al principio del historial.
+    -- Ctrl+End: volver al presente.
+    if m.ctrl and not m.shift then
+        if n == "Home" then
+            self:scrollback_top()
+            return true
+        elseif n == "End" then
+            self:scrollback_bottom()
+            return true
+        end
+    end
+
     -- ── Tamaño de fuente ──
     if m.ctrl and not m.alt and not m.super then
         if n == "plus" or n == "KP_Add"
@@ -323,6 +592,14 @@ function Terminal:on_key(key)
     -- antes de que llegara la 'c'.
     local tr = keys.translate(key)
     if not tr then return false end
+
+    -- Escribir con scrollback activo: volver al vivo. El usuario
+    -- quiso enviar input, no seguir mirando historia.
+    if self.scrollback_offset > 0 then
+        self.scrollback_offset = 0
+        self:_sync_scrollbar()
+        if self.window then self.window:damage_all() end
+    end
 
     -- Va al shell. Limpiar seleccion (convencion xterm: escribir
     -- invalida la seleccion previa).
