@@ -285,6 +285,12 @@ end
 -- procesando -> "bad callback" de LuaJIT. El sync del scrollbar
 -- se hace desde _on_pty_readable, afuera del callback.
 function Terminal:_push_scrollback_line(text)
+    -- Detectar rotacion: si el buffer ya estaba al tope, la nueva
+    -- linea desplaza a la mas vieja. Todos los indices del buffer
+    -- bajan en 1. Si hay seleccion, hay que reflejar eso para no
+    -- dejarla apuntando a contenido distinto.
+    local rotates = (self.scrollback_count >= self.scrollback_max)
+
     self.scrollback[self.scrollback_head] = text
     self.scrollback_head = (self.scrollback_head % self.scrollback_max) + 1
     if self.scrollback_count < self.scrollback_max then
@@ -292,6 +298,10 @@ function Terminal:_push_scrollback_line(text)
     end
     self._scrollback_dirty = true
     self._layout_cache = nil   -- invalidar layout
+
+    if rotates and self.sel and not self.sel:is_empty() then
+        self.sel:shift(-1)
+    end
 end
 
 -- Devuelve la linea N-esima contada desde el final del scrollback.
@@ -535,12 +545,15 @@ function Terminal:draw(cr)
     }
 
     -- El highlight de seleccion se pinta tambien en modo
-    -- scrollback: con el auto-scroll el usuario esta scrolleado
-    -- justo cuando esta seleccionando, y sin esto la banda azul
-    -- desaparecia al arrastrar mas alla del viewport.
+    -- scrollback. La conversion fila visual -> brow la hace este
+    -- callback, porque Sel guarda coordenadas de buffer.
     local selected = nil
     if not self.sel:is_empty() then
-        selected = function(r, c) return self.sel:contains(r, c) end
+        local self_ = self
+        selected = function(vrow, c)
+            return self_.sel:contains(
+                self_:visual_to_buffer(vrow), c)
+        end
     end
 
     local layout = self:_build_scrollback_layout()
@@ -698,7 +711,7 @@ function Terminal:on_mouse_press(mx, my, button)
             local xcb = require("lib.xcb")
             xcb.grab_pointer(self.window.conn, self.window.id)
         end
-        self.sel:start(row, col)
+        self.sel:start(self:visual_to_buffer(row), col)
         self._dragging = true
         if self.window then self.window:damage_all() end
         return true
@@ -746,31 +759,17 @@ function Terminal:on_mouse_move(mx, my)
 
     if not self._dragging then return false end
 
-    -- Auto-scroll: si el mouse salio del rect del widget, scrollear
-    -- el scrollback por 1 linea y ajustar el ancla de la seleccion.
-    --
-    -- El ancla apunta a una fila VISUAL (0..rows-1). Cuando el
-    -- viewport scrollea, el contenido de la fila N se corre a N+1
-    -- (scroll hacia arriba) o N-1 (scroll hacia abajo). Sin el
-    -- ajuste, la seleccion se deforma al scrollear.
+    -- Auto-scroll: si el mouse salio del rect del widget, mover el
+    -- scrollback por 1 linea. El ancla NO se toca (esta en coords
+    -- de buffer); solo cambia el scrollback_offset, asi que la
+    -- fila visual 0 apunta al contenido correcto despues del
+    -- scroll.
     local urow = self:_cell_at_unclamped(mx, my)
     if urow < 0 then
         self:scrollback_up(1)
-        if self.sel.anchor then
-            self.sel.anchor.row = self.sel.anchor.row + 1
-            if self.sel.anchor.row > self.rows - 1 then
-                self.sel.anchor.row = self.rows - 1
-            end
-        end
         row = 0
     elseif urow >= self.rows then
         self:scrollback_down(1)
-        if self.sel.anchor then
-            self.sel.anchor.row = self.sel.anchor.row - 1
-            if self.sel.anchor.row < 0 then
-                self.sel.anchor.row = 0
-            end
-        end
         row = self.rows - 1
     end
 
@@ -778,7 +777,7 @@ function Terminal:on_mouse_move(mx, my)
     if col < 0 then col = 0 end
     if col >= self.cols then col = self.cols - 1 end
 
-    self.sel:extend(row, col)
+    self.sel:extend(self:visual_to_buffer(row), col)
     if self.window then self.window:damage_all() end
     return true
 end
@@ -839,11 +838,11 @@ function Terminal:on_mouse_release(mx, my, button)
         xcb.ungrab_pointer(self.window.conn)
     end
 
-    self.sel:extend(row, col)
+    self.sel:extend(self:visual_to_buffer(row), col)
     self.sel:finish()
     -- Copy-on-select: si hay seleccion, copiar a PRIMARY.
     if not self.sel:is_empty() then
-        local text = self.sel:get_text(self.term, self.cols)
+        local text = self.sel:get_text(self, self.cols)
         if text and text ~= "" then
             clip.copy_to("primary", text)
         end
@@ -883,7 +882,7 @@ function Terminal:on_key(key)
     -- y Shift+Insert). Se mantienen porque son parte del estandar
     -- X11 y casi nadie los reasigna.
     if m.ctrl and not m.shift and (n == "Insert") then
-        local text = self.sel:get_text(self.term, self.cols)
+        local text = self.sel:get_text(self, self.cols)
         if text and text ~= "" then clip.copy_to("clipboard", text) end
         return true
     end
@@ -895,7 +894,7 @@ function Terminal:on_key(key)
 
     -- Copy.
     if kb.match(key, b.copy) then
-        local text = self.sel:get_text(self.term, self.cols)
+        local text = self.sel:get_text(self, self.cols)
         if text and text ~= "" then
             clip.copy_to("clipboard", text)
             log.info("terminal", "copy %d bytes", #text)
@@ -1080,6 +1079,51 @@ function Terminal:_paste(text)
     pty.write(self.pty.fd, seq)
     log.info("terminal", "paste %d bytes (bracketed=%s)",
         #text, tostring(self.term and self.term._bracketed_paste))
+end
+
+-- ── Coordenadas de buffer ─────────────────────────────────
+--
+-- El buffer total tiene scrollback_count + rows filas. brow = 0
+-- es la linea mas vieja del scrollback; brow = scrollback_count
+-- es la fila 0 del vterm vivo; brow = scrollback_count + rows - 1
+-- es la ultima fila del vterm.
+--
+-- El viewport muestra, empezando por arriba:
+--   buffer_row_start = scrollback_count - scrollback_offset
+-- Las filas visuales 0..rows-1 mapean a:
+--   brow = buffer_row_start + vrow
+
+-- vrow (0..rows-1) -> brow (indice del buffer).
+function Terminal:visual_to_buffer(vrow)
+    return self.scrollback_count - self.scrollback_offset + vrow
+end
+
+-- brow -> vrow. Fuera de rango devuelve <0 o >=rows.
+function Terminal:buffer_to_visual(brow)
+    return brow - (self.scrollback_count - self.scrollback_offset)
+end
+
+-- Devuelve la celda en la posicion del BUFFER (brow, col). Si
+-- brow cae en el scrollback, construye una celda minima con el
+-- codepoint correspondiente del texto plano. Si cae en el vterm
+-- vivo, delega. Fuera de rango devuelve nil.
+function Terminal:buffer_cell_at(brow, col)
+    if col < 0 or col >= self.cols then return nil end
+    if brow < 0 then return nil end
+    if brow < self.scrollback_count then
+        local idx = self.scrollback_count - brow
+        local text = self:scrollback_line(idx)
+        local i = 0
+        for ch in text:gmatch("[%z\1-\127\194-\244][\128-\191]*") do
+            if i == col then return { utf8 = ch, width = 1 } end
+            i = i + 1
+        end
+        return { utf8 = "", width = 1 }
+    else
+        local vrow = brow - self.scrollback_count
+        if vrow >= self.rows then return nil end
+        return self.term:cell(vrow, col)
+    end
 end
 
 function Terminal:destroy()
