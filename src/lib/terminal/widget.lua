@@ -534,8 +534,12 @@ function Terminal:draw(cr)
         color = self.default_cursor,
     }
 
+    -- El highlight de seleccion se pinta tambien en modo
+    -- scrollback: con el auto-scroll el usuario esta scrolleado
+    -- justo cuando esta seleccionando, y sin esto la banda azul
+    -- desaparecia al arrastrar mas alla del viewport.
     local selected = nil
-    if not in_sb and not self.sel:is_empty() then
+    if not self.sel:is_empty() then
         selected = function(r, c) return self.sel:contains(r, c) end
     end
 
@@ -560,6 +564,14 @@ function Terminal:_cell_at(mx, my)
     if col >= self.cols then col = self.cols - 1 end
     if row >= self.rows then row = self.rows - 1 end
     return row, col
+end
+
+-- Version sin clamp. Devuelve row/col crudos (pueden ser negativos
+-- o mas alla del viewport). El llamador decide. Necesario para
+-- detectar que el mouse salio del widget durante un drag.
+function Terminal:_cell_at_unclamped(mx, my)
+    local cw, ch = self.renderer:cell_size()
+    return math.floor(my / ch), math.floor(mx / cw)
 end
 
 -- Mods del mouse: bitmask xterm.
@@ -678,6 +690,14 @@ function Terminal:on_mouse_press(mx, my, button)
     end
 
     if button == 1 then
+        -- Grab de puntero: X redirige los MotionNotify a nuestra
+        -- ventana aunque el mouse salga del rect del widget. Sin
+        -- esto, arrastrar hacia arriba del widget corta los
+        -- eventos y no se puede seleccionar mas alla de lo visible.
+        if self.window and self.window.conn then
+            local xcb = require("lib.xcb")
+            xcb.grab_pointer(self.window.conn, self.window.id)
+        end
         self.sel:start(row, col)
         self._dragging = true
         if self.window then self.window:damage_all() end
@@ -725,6 +745,39 @@ function Terminal:on_mouse_move(mx, my)
     end
 
     if not self._dragging then return false end
+
+    -- Auto-scroll: si el mouse salio del rect del widget, scrollear
+    -- el scrollback por 1 linea y ajustar el ancla de la seleccion.
+    --
+    -- El ancla apunta a una fila VISUAL (0..rows-1). Cuando el
+    -- viewport scrollea, el contenido de la fila N se corre a N+1
+    -- (scroll hacia arriba) o N-1 (scroll hacia abajo). Sin el
+    -- ajuste, la seleccion se deforma al scrollear.
+    local urow = self:_cell_at_unclamped(mx, my)
+    if urow < 0 then
+        self:scrollback_up(1)
+        if self.sel.anchor then
+            self.sel.anchor.row = self.sel.anchor.row + 1
+            if self.sel.anchor.row > self.rows - 1 then
+                self.sel.anchor.row = self.rows - 1
+            end
+        end
+        row = 0
+    elseif urow >= self.rows then
+        self:scrollback_down(1)
+        if self.sel.anchor then
+            self.sel.anchor.row = self.sel.anchor.row - 1
+            if self.sel.anchor.row < 0 then
+                self.sel.anchor.row = 0
+            end
+        end
+        row = self.rows - 1
+    end
+
+    -- Clamp horizontal al borde de la fila (no hay scroll lateral).
+    if col < 0 then col = 0 end
+    if col >= self.cols then col = self.cols - 1 end
+
     self.sel:extend(row, col)
     if self.window then self.window:damage_all() end
     return true
@@ -779,6 +832,13 @@ function Terminal:on_mouse_release(mx, my, button)
     if button ~= 1 then return false end
     if not self._dragging then return false end
     self._dragging = false
+
+    -- Liberar el grab de puntero tras la seleccion.
+    if self.window and self.window.conn then
+        local xcb = require("lib.xcb")
+        xcb.ungrab_pointer(self.window.conn)
+    end
+
     self.sel:extend(row, col)
     self.sel:finish()
     -- Copy-on-select: si hay seleccion, copiar a PRIMARY.
